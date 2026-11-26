@@ -3,8 +3,13 @@
 #include <vector>
 #include <algorithm>
 #include <cstdlib>
+#include <fstream>
+#include <sstream>
 
 #include "mt_game.h"
+#ifdef MT_ENABLE_NETPLAY
+#include "mt_netplay.h"
+#endif
 #include "librecomp/game.hpp"
 #include "librecomp/overlays.hpp"
 #ifndef MT_LIVE_RECOMP
@@ -176,4 +181,254 @@ extern "C" void mt_on_segment_loaded(uint8_t* rdram, uint32_t rom_end, uint32_t 
         activate(info->vram);
     }
     activate(dest);
+}
+
+namespace {
+    constexpr gpr netplay_frame_address = (gpr)(int32_t)0x80061F48;
+#ifdef MT_ENABLE_NETPLAY
+    mt::netplay::StateCheck court_checkpoint;
+#endif
+
+    struct ReplayPad {
+        unsigned buttons;
+        int x;
+        int y;
+    };
+
+    struct ReplayFrame {
+        ReplayPad pads[4];
+    };
+
+    [[noreturn]] void end_replay(int status) {
+        // This hook runs on a game thread. Global teardown is owned by the host.
+        std::fflush(stderr);
+        std::_Exit(status);
+    }
+
+    std::vector<ReplayFrame> read_replay(const char* path) {
+        std::ifstream input{path};
+        std::vector<ReplayFrame> frames;
+        std::string line;
+        while (std::getline(input, line)) {
+            std::istringstream row(line);
+            uint32_t frame;
+            ReplayFrame sample{};
+            if (!(row >> frame >> sample.pads[0].buttons >> sample.pads[0].x >> sample.pads[0].y
+                                >> sample.pads[1].buttons >> sample.pads[1].x >> sample.pads[1].y) ||
+                frame != frames.size()) {
+                fprintf(stderr, "[netreplay] invalid or missing record for guest frame %zu\n", frames.size());
+                end_replay(2);
+            }
+            if ((row >> std::ws) && !row.eof() &&
+                (!(row >> sample.pads[2].buttons >> sample.pads[2].x >> sample.pads[2].y
+                       >> sample.pads[3].buttons >> sample.pads[3].x >> sample.pads[3].y) ||
+                 ((row >> std::ws) && !row.eof()))) {
+                fprintf(stderr, "[netreplay] invalid four-player record for guest frame %u\n", frame);
+                end_replay(2);
+            }
+            for (const ReplayPad& pad : sample.pads) {
+                if (pad.buttons > 0xFFFF || pad.x < -128 || pad.x > 127 || pad.y < -128 || pad.y > 127) {
+                    fprintf(stderr, "[netreplay] controller value out of range at guest frame %u\n", frame);
+                    end_replay(2);
+                }
+            }
+            frames.push_back(sample);
+        }
+        if (frames.empty()) {
+            fprintf(stderr, "[netreplay] unable to read any frames from %s\n", path);
+            end_replay(2);
+        }
+        return frames;
+    }
+}
+
+extern "C" void mt_trace_netplay_guest(uint8_t* rdram, uint32_t pc, uint32_t detail) {
+    static const bool enabled = [] {
+        const char* value = std::getenv("MT_NETPLAY_TRACE");
+        return value != nullptr && value[0] == '1';
+    }();
+    if (!enabled) return;
+
+    constexpr gpr rng_address = (gpr)(int32_t)0x8005CC10;
+    const uint32_t frame = MEM_W(0, netplay_frame_address);
+    const uint32_t cursor = MEM_W(0, rng_address);
+    const uint32_t rng_word = MEM_W(4, rng_address);
+    if (pc == 0x80033874 && detail >= 0x80000000 && detail <= 0x807FFFF6 && detail % 2 == 0) {
+        const gpr pads = (gpr)(int32_t)detail;
+        fprintf(stderr, "[nettrace] frame=%u pc=%08X rng=%08X/%08X p1=%04X,%d,%d p2=%04X,%d,%d\n",
+            frame, pc, cursor, rng_word,
+            (unsigned)MEM_HU(0, pads), (int)MEM_B(2, pads), (int)MEM_B(3, pads),
+            (unsigned)MEM_HU(6, pads), (int)MEM_B(8, pads), (int)MEM_B(9, pads));
+        return;
+    }
+    fprintf(stderr, "[nettrace] frame=%u pc=%08X rng=%08X/%08X detail=%08X\n",
+        frame, pc, cursor, rng_word, detail);
+}
+
+extern "C" uint32_t mt_netplay_rng_count(uint8_t* rdram, uint32_t count) {
+    static const bool fixed = [] {
+        const char* value = std::getenv("MT_NETPLAY_FIXED_RNG");
+#ifdef MT_ENABLE_NETPLAY
+        if (mt::netplay::role() != mt::netplay::Role::Offline) return true;
+#endif
+        return value != nullptr && value[0] == '1';
+    }();
+    if (fixed) {
+        // This loop may retry its message wait within a frame. Apply the
+        // extra advances once, independent of the host clock and retries.
+        static uint32_t last_frame = 0;
+        const uint32_t frame = MEM_W(0, netplay_frame_address);
+        const uint32_t advances = frame != last_frame ? frame & 7u : 0;
+        last_frame = frame;
+        count = (count & ~7u) | advances;
+    }
+    mt_trace_netplay_guest(rdram, 0x80031FF0, count & 7u);
+    return count;
+}
+
+extern "C" void mt_netplay_read_pads(uint8_t* rdram, uint32_t address) {
+    // One row per guest frame, with buttons, X and Y for each port. A frame
+    // may poll controls more than once, so hold the sample for every read.
+    static const char* replay_path = std::getenv("MT_NETPLAY_REPLAY");
+    const bool playing_tape = replay_path != nullptr && replay_path[0] != '\0';
+    static const std::vector<ReplayFrame> replay = playing_tape ? read_replay(replay_path) : std::vector<ReplayFrame>{};
+#ifdef MT_ENABLE_NETPLAY
+    const auto role = mt::netplay::role();
+    const bool lan = role != mt::netplay::Role::Offline;
+#else
+    constexpr bool lan = false;
+#endif
+    if (playing_tape || lan) {
+        const uint32_t frame = MEM_W(0, netplay_frame_address);
+        const bool tape_ended = playing_tape && frame >= replay.size();
+        if (tape_ended && !lan) {
+            fprintf(stderr, "[netreplay] completed at guest frame %u\n", frame);
+            end_replay(0);
+        }
+        unsigned port_count = 2;
+#ifdef MT_ENABLE_NETPLAY
+        if (lan) port_count = mt::netplay::player_count();
+#endif
+        if (address < 0x80000000 || address > 0x80800000u - (6 * port_count - 1) || address % 2 != 0) {
+            fprintf(stderr, "[netreplay] invalid controller buffer at guest frame %u\n", frame);
+            end_replay(2);
+        }
+        const gpr pads = (gpr)(int32_t)address;
+#ifdef MT_ENABLE_NETPLAY
+        if (lan) {
+            using namespace mt::netplay;
+            static uint32_t next_tick = 0;
+            static Pads admitted{};
+            // Complete a common terminal tick even when the game skipped a
+            // controller read just before the end of the tape.
+            const uint32_t target = tape_ended ? static_cast<uint32_t>(replay.size()) : frame;
+            while (next_tick <= target) {
+                Pads local{};
+                for (unsigned i = 0; i < pads_per_peer(); ++i) {
+                    const unsigned port = first_local_port() + i;
+                    const int offset = 6 * port;
+                    if (!playing_tape) {
+                        local[i] = {MEM_HU(offset, pads), MEM_B(offset + 2, pads), MEM_B(offset + 3, pads)};
+                    } else if (next_tick + input_delay < replay.size()) {
+                        const auto& sample = replay[next_tick + input_delay].pads[port];
+                        local[i] = {uint16_t(sample.buttons), int8_t(sample.x), int8_t(sample.y)};
+                    }
+                }
+                if (!admit(next_tick, local, court_checkpoint, admitted)) end_replay(3);
+                ++next_tick;
+            }
+            if (tape_ended) {
+                drain_replay();
+                fprintf(stderr, "[netreplay] completed at guest frame %u\n", frame);
+                end_replay(0);
+            }
+            for (unsigned port = 0; port < port_count; ++port) {
+                const int offset = 6 * port;
+                MEM_HU(offset, pads) = admitted[port].buttons;
+                MEM_B(offset + 2, pads) = admitted[port].x;
+                MEM_B(offset + 3, pads) = admitted[port].y;
+                MEM_B(offset + 4, pads) = 0;
+            }
+            static const bool trace = std::getenv("MT_NETPLAY_TRACE") != nullptr;
+            if (trace && port_count == 4) {
+                fprintf(stderr, "[netpads] frame=%u", frame);
+                for (unsigned port = 0; port < port_count; ++port) {
+                    const auto& pad = admitted[port];
+                    fprintf(stderr, " p%u=%04X,%d,%d", port + 1, unsigned(pad.buttons), int(pad.x), int(pad.y));
+                }
+                fprintf(stderr, "\n");
+            }
+            mt_trace_netplay_guest(rdram, 0x80033874, address);
+            return;
+        }
+#endif
+        for (int port = 0; port < 2; port++) {
+            const ReplayPad& sample = replay[frame].pads[port];
+            const int offset = 6 * port;
+            MEM_HU(offset, pads) = (uint16_t)sample.buttons;
+            MEM_B(offset + 2, pads) = (int8_t)sample.x;
+            MEM_B(offset + 3, pads) = (int8_t)sample.y;
+            MEM_B(offset + 4, pads) = 0;
+        }
+    }
+    mt_trace_netplay_guest(rdram, 0x80033874, address);
+}
+
+extern "C" void mt_trace_court_state(uint8_t* rdram) {
+    static const bool enabled = std::getenv("MT_NETPLAY_COURT_TRACE") != nullptr;
+#ifdef MT_ENABLE_NETPLAY
+    const bool lan = mt::netplay::role() != mt::netplay::Role::Offline;
+#else
+    constexpr bool lan = false;
+#endif
+    if (!enabled && !lan) return;
+
+    constexpr gpr ball = (gpr)(int32_t)0x8015B0D8;
+    constexpr gpr points = (gpr)(int32_t)0x8015344A;
+    constexpr gpr player_one = (gpr)(int32_t)0x80157010;
+    constexpr gpr player_two = (gpr)(int32_t)0x801571F8;
+    static uint32_t step = 0;
+    const uint32_t current_step = step++;
+    const uint32_t frame = MEM_W(0, netplay_frame_address);
+#ifdef MT_ENABLE_NETPLAY
+    if (lan && current_step % 30 == 0) {
+        // Hash only simulation fields sampled immediately after live ball physics.
+        const uint32_t values[] = {
+            frame,
+            (uint32_t)MEM_W(0x0C, ball), (uint32_t)MEM_W(0x10, ball), (uint32_t)MEM_W(0x14, ball),
+            (uint32_t)MEM_W(0x18, ball), (uint32_t)MEM_W(0x1C, ball), (uint32_t)MEM_W(0x20, ball),
+            (uint32_t)MEM_W(0x88, ball), (uint32_t)MEM_BU(0x93, ball), (uint32_t)MEM_BU(0x97, ball),
+            (uint32_t)MEM_W(0, player_one), (uint32_t)MEM_W(4, player_one), (uint32_t)MEM_W(8, player_one),
+            (uint32_t)MEM_W(0, player_two), (uint32_t)MEM_W(4, player_two), (uint32_t)MEM_W(8, player_two),
+            (uint32_t)MEM_BU(0, points), (uint32_t)MEM_BU(1, points),
+        };
+        uint32_t hash = 2166136261u;
+        for (uint32_t word : values) {
+            for (unsigned shift = 0; shift < 32; shift += 8) {
+                hash = (hash ^ ((word >> shift) & 0xffu)) * 16777619u;
+            }
+        }
+        if (mt::netplay::player_count() == 4) {
+            for (int port = 2; port < 4; ++port) {
+                for (int axis = 0; axis < 3; ++axis) {
+                    const uint32_t word = MEM_W(port * 0x1E8 + axis * 4, player_one);
+                    for (unsigned shift = 0; shift < 32; shift += 8)
+                        hash = (hash ^ ((word >> shift) & 0xffu)) * 16777619u;
+                }
+            }
+        }
+        court_checkpoint = {current_step + 1, hash};
+    }
+#endif
+    if (!enabled) return;
+    std::fprintf(stderr,
+        "[court] step=%u frame=%u pos=%d,%d,%d vel=%08X,%08X,%08X mode=%08X bounces=%u hitter=%u"
+        " p1=%d,%d,%d p2=%d,%d,%d points=%u,%u\n",
+        current_step, frame,
+        (int32_t)MEM_W(0x0C, ball), (int32_t)MEM_W(0x10, ball), (int32_t)MEM_W(0x14, ball),
+        (uint32_t)MEM_W(0x18, ball), (uint32_t)MEM_W(0x1C, ball), (uint32_t)MEM_W(0x20, ball),
+        (uint32_t)MEM_W(0x88, ball), (unsigned)MEM_BU(0x93, ball), (unsigned)MEM_BU(0x97, ball),
+        (int32_t)MEM_W(0, player_one), (int32_t)MEM_W(4, player_one), (int32_t)MEM_W(8, player_one),
+        (int32_t)MEM_W(0, player_two), (int32_t)MEM_W(4, player_two), (int32_t)MEM_W(8, player_two),
+        (unsigned)MEM_BU(0, points), (unsigned)MEM_BU(1, points));
 }

@@ -1,0 +1,124 @@
+diff --git a/src/transport/rnet_transport.h b/src/transport/rnet_transport.h
+--- a/src/transport/rnet_transport.h
++++ b/src/transport/rnet_transport.h
+@@ -27,6 +27,13 @@
+     /* Host-as-relay: fan-out to every learned seat (slot 0 only). */
+     int hub_mode;
+     int hub_slot_known[RNET_MAX_SLOTS];
++#ifdef RNET_MT_LAN_SEAT_LOCK
++    int hub_expected_slots;
++    rnet_u32 hub_magic;
++    rnet_u32 hub_session_id;
++    int hub_locked;
++    rnet_u64 hub_last_rx_ms[RNET_MAX_SLOTS];
++#endif
+     struct sockaddr_in hub_slot_addr[RNET_MAX_SLOTS];
+     /* ICE callbacks filled by ice module when mode == ICE. */
+     int (*ice_send)(void *ice_ctx, const rnet_u8 *buf, size_t len);
+diff --git a/src/session/rnet_session.c b/src/session/rnet_session.c
+--- a/src/session/rnet_session.c
++++ b/src/session/rnet_session.c
+@@ -2804,6 +2804,14 @@
+     {
+         return -1;
+     }
++#ifdef RNET_MT_LAN_SEAT_LOCK
++    if (s->cfg.local_slot == 0 && s->cfg.slot_count == 4)
++    {
++        s->transport.hub_expected_slots = s->cfg.slot_count;
++        s->transport.hub_magic = s->cfg.protocol_magic;
++        s->transport.hub_session_id = s->cfg.session_id;
++    }
++#endif
+     s->phase = RNET_PHASE_LINKING;
+     s->last_hello_ms = 0;
+     return 0;
+diff --git a/src/transport/rnet_transport.c b/src/transport/rnet_transport.c
+--- a/src/transport/rnet_transport.c
++++ b/src/transport/rnet_transport.c
+@@ -39,6 +39,11 @@
+     memset(t->hub_ice_ctx, 0, sizeof(t->hub_ice_ctx));
+     t->hub_rr = 0;
+     memset(t->hub_slot_known, 0, sizeof(t->hub_slot_known));
++#ifdef RNET_MT_LAN_SEAT_LOCK
++    t->hub_expected_slots = 0;
++    t->hub_locked = 0;
++    memset(t->hub_last_rx_ms, 0, sizeof(t->hub_last_rx_ms));
++#endif
+     memset(t->hub_slot_addr, 0, sizeof(t->hub_slot_addr));
+     rnet_netsim_destroy(t->netsim);
+     t->netsim = NULL;
+@@ -192,6 +197,50 @@
+     return 1;
+ }
+ 
++#ifdef RNET_MT_LAN_SEAT_LOCK
++/* A valid HELLO reserves a seat. Before START an expired reservation can be
++ * reclaimed. During a match the endpoint remains fixed. */
++static int hub_accept_source(RNetTransport *t, const rnet_u8 *buf, int n,
++                             const struct sockaddr_in *src)
++{
++    RNetDecodedPacket pkt;
++    if (rnet_proto_decode(buf, (size_t)n, t->hub_magic, &pkt) != 0 ||
++        pkt.session_id != t->hub_session_id ||
++        pkt.type == RNET_PKT_START || pkt.type == RNET_PKT_DELAY_SYNC)
++    {
++        return 0;
++    }
++
++    int slot = pkt.local_slot;
++    if (slot < 1 || slot >= t->hub_expected_slots)
++    {
++        return 0;
++    }
++    rnet_u64 now = rnet_os_monotonic_ms();
++    int reserved = t->hub_slot_known[slot] &&
++        (t->hub_locked || now - t->hub_last_rx_ms[slot] <= 3000ULL);
++    if (reserved && !sockaddr_equal(&t->hub_slot_addr[slot], src))
++    {
++        if (pkt.type == RNET_PKT_HELLO)
++        {
++            rnet_u8 reply[RNET_MAX_PACKET];
++            int len = rnet_proto_encode_modset_ack(reply, sizeof(reply), t->hub_magic,
++                t->hub_session_id, 0, 4, "seat already occupied");
++            if (len > 0)
++                (void)rnet_os_sendto(t->sock, reply, (size_t)len, src);
++        }
++        return 0;
++    }
++    if (!reserved && (t->hub_locked || pkt.type != RNET_PKT_HELLO ||
++                      pkt.slot_count != t->hub_expected_slots))
++    {
++        return 0;
++    }
++    t->hub_last_rx_ms[slot] = now;
++    return 1;
++}
++#endif
++
+ static void hub_learn_and_forward(RNetTransport *t, const rnet_u8 *buf, int n, const struct sockaddr_in *src)
+ {
+     int slot = -1;
+@@ -256,6 +305,11 @@
+         }
+         if (t->hub_mode)
+         {
++#ifdef RNET_MT_LAN_SEAT_LOCK
++            if (t->hub_expected_slots && len >= RNET_HUB_MIN_PACKET &&
++                buf[4] == RNET_PKT_START && buf[5] == 0)
++                t->hub_locked = 1;
++#endif
+             for (i = 0; i < RNET_MAX_SLOTS; ++i)
+             {
+                 int r;
+@@ -351,6 +405,10 @@
+             }
+             if (t->hub_mode)
+             {
++#ifdef RNET_MT_LAN_SEAT_LOCK
++                if (t->hub_expected_slots && !hub_accept_source(t, buf, n, &src))
++                    continue;
++#endif
+                 hub_learn_and_forward(t, buf, n, &src);
+                 *out_src = src;
+                 *out_have_src = 1;

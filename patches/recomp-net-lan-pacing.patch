@@ -1,0 +1,19 @@
+--- a/src/session/rnet_session.c
++++ b/src/session/rnet_session.c
+@@ -2677,8 +2677,15 @@
+         rnet_u32 index = w % RNET_HISTORY_LENGTH;
+         if (s->published_valid[index] && s->published_tick[index] == w)
+         {
++            rnet_u64 resend_ms = 4ULL;
++#ifdef RNET_MT_LAN_CONFIRM_PACING
++            /* Keep the recovery window intact but avoid resending every
++             * already played tick at the same rate as the active tick. */
++            if (w < play_wire)
++                resend_ms = 80ULL;
++#endif
+             if (s->confirm_last_sent_ms[index] == 0 ||
+-                now - s->confirm_last_sent_ms[index] >= 4ULL)
++                now - s->confirm_last_sent_ms[index] >= resend_ms)
+                 send_input_confirm_tick(s, w, s->published_hash[index]);
+         }
+         else

@@ -550,9 +550,31 @@ void recomp::set_input_controller_filter(int index) {
 // controllers are connected (plus one more for the keyboard in On + Keyboard mode). Testing aid:
 // MT_PLAYERS=n reports n players regardless of controllers (player 2 can then be driven with
 // MT_INPUT_P2).
+#ifdef MT_ENABLE_NETPLAY
+#include "mt_netplay.h"
+#endif
+
 recomp::PortSource recomp::mt_port_source(int port) {
     PortSource src{};
     if (port < 0 || port > 3) return src;
+#ifdef MT_ENABLE_NETPLAY
+    if (mt::netplay::role() != mt::netplay::Role::Offline) {
+        const int first = static_cast<int>(mt::netplay::first_local_port());
+        const int count = static_cast<int>(mt::netplay::pads_per_peer());
+        const int local = port - first;
+        src.present = port < static_cast<int>(mt::netplay::player_count());
+        if (local < 0 || local >= count) {
+            src.controller = -2;
+            return src;
+        }
+
+        const int devices = static_cast<int>(recomp::get_connected_controller_count());
+        src.keyboard = local == 0;
+        const int index = count == 2 && devices == 1 ? local - 1 : local;
+        src.controller = index >= 0 && index < devices ? index : -2;
+        return src;
+    }
+#endif
     static const int forced_players = std::getenv("MT_PLAYERS") ? std::atoi(std::getenv("MT_PLAYERS")) : 0;
     const int controllers = (int)recomp::get_connected_controller_count();
     {

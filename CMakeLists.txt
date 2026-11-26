@@ -63,6 +63,29 @@ target_compile_definitions(rmlui_core PRIVATE LUNASVG_BUILD_STATIC)
 
 add_subdirectory(${CMAKE_SOURCE_DIR}/lib/N64ModernRuntime)
 
+# Leave the normal offline build independent of the optional LAN dependency.
+set(MT_RECOMP_NET_SOURCE_DIR "" CACHE PATH "Local checkout of the tested recomp-net revision")
+if(MT_RECOMP_NET_SOURCE_DIR)
+    set(RNET_ENABLE_ICE OFF)
+    set(RNET_BUILD_EXAMPLES OFF)
+    set(RNET_BUILD_TESTS OFF)
+    set(RNET_BUILD_MODULE OFF)
+    file(STRINGS "${MT_RECOMP_NET_SOURCE_DIR}/src/session/rnet_session.c" mt_net_pacing_marker REGEX "RNET_MT_LAN_CONFIRM_PACING")
+    if(NOT mt_net_pacing_marker)
+        message(FATAL_ERROR "Apply patches/recomp-net-lan-pacing.patch to the pinned recomp-net checkout before building.")
+    endif()
+    file(STRINGS "${MT_RECOMP_NET_SOURCE_DIR}/src/transport/rnet_transport.c" mt_net_seat_marker REGEX "RNET_MT_LAN_SEAT_LOCK")
+    if(NOT mt_net_seat_marker)
+        message(FATAL_ERROR "Apply patches/recomp-net-lan-reservations.patch before building.")
+    endif()
+    add_subdirectory("${MT_RECOMP_NET_SOURCE_DIR}" "${CMAKE_CURRENT_BINARY_DIR}/recomp-net" EXCLUDE_FROM_ALL)
+    target_compile_definitions(recomp_net PRIVATE RNET_MT_LAN_CONFIRM_PACING RNET_MT_LAN_SEAT_LOCK)
+    if(CMAKE_C_COMPILER_ID STREQUAL "MSVC")
+        target_compile_options(recomp_net PRIVATE /experimental:c11atomics)
+    endif()
+endif()
+
+
 target_include_directories(rt64 PRIVATE ${CMAKE_BINARY_DIR}/rt64/src)
 
 # Mario Tennis recomp: Slang shader presets (CRT-Royale etc.) through librashader, loaded at runtime from
@@ -161,6 +184,12 @@ set (SOURCES
 
     ${CMAKE_SOURCE_DIR}/lib/RmlUi/Backends/RmlUi_Platform_SDL.cpp
 )
+
+if(MT_RECOMP_NET_SOURCE_DIR)
+    list(APPEND SOURCES "${CMAKE_SOURCE_DIR}/src/game/mt_netplay.cpp")
+    target_compile_definitions(MarioTennisRecompiled PRIVATE MT_ENABLE_NETPLAY)
+    target_link_libraries(MarioTennisRecompiled PRIVATE recomp_net::recomp_net)
+endif()
 
 if (APPLE)
     list(APPEND SOURCES ${CMAKE_SOURCE_DIR}/src/main/support_apple.mm)

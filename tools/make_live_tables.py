@@ -39,7 +39,9 @@ def main():
     natives = sorted(n for n in all_names if n in reimpl)
     # Built-in ignored libultra internals only need a native if the game actually calls them; the
     # offline build's output tells us which ones it referenced (all others never link).
-    called = set()
+    # Live-only builds have no RecompiledFuncs directory. Keep the ignored
+    # libultra functions referenced by the checked-in USA live tables.
+    called = {"__osContRamRead", "__osContRamWrite", "__osPfsGetStatus", "osMapTLB", "osUnmapTLBAll"}
     funcs_dir = os.path.join(ROOT, "RecompiledFuncs")
     if os.path.isdir(funcs_dir):
         for fn in os.listdir(funcs_dir):

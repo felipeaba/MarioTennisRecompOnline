@@ -42,6 +42,9 @@ extern "C" void mt_prof_event(const char* what, uint32_t arg);
 #include "zelda_support.h"
 #include "zelda_game.h"
 #include "mt_game.h"
+#ifdef MT_ENABLE_NETPLAY
+#include "../game/mt_netplay.h"
+#endif
 #include "librecomp/game.hpp"
 #include "librecomp/mods.hpp"
 #include "librecomp/helpers.hpp"
@@ -647,6 +650,29 @@ int main(int argc, char** argv) {
 
     recomp::register_config_path(zelda64::get_app_folder_path());
 
+    bool netplay_requested = false;
+#ifdef MT_ENABLE_NETPLAY
+    auto role = mt::netplay::role();
+    netplay_requested = role != mt::netplay::Role::Offline;
+    if (netplay_requested) {
+        if (!recomp::verify_stored_rom(supported_games.front())) {
+            std::fprintf(stderr, "[netplay] Store a valid Mario Tennis (USA) ROM before starting LAN.\n");
+            return EXIT_FAILURE;
+        }
+        const std::string manifest = "MarioTennisRecomp/" + version_string +
+            ";netplay=2;rom-xxh3=4E535EA5C4BB222F;save=eep16k-zero;players=" +
+            std::to_string(mt::netplay::player_count()) + ";cheats=off;"
+            "delay=2;rollback=off;settings=shared-menu";
+        if (!mt::netplay::start(manifest)) return EXIT_FAILURE;
+        ultramodern::set_volatile_saving();
+    }
+#else
+    if (std::getenv("MT_NETPLAY_HOST") || std::getenv("MT_NETPLAY_JOIN")) {
+        std::fprintf(stderr, "[netplay] This build has no recomp-net support.\n");
+        return EXIT_FAILURE;
+    }
+#endif
+
     // Register supported games and patches
     for (const auto& game : supported_games) {
         recomp::register_game(game);
@@ -726,7 +752,8 @@ int main(int argc, char** argv) {
     // Developer convenience: MT_AUTOSTART=1 boots the stored ROM without going through the
     // launcher (used for smoke tests). Normal launches are unaffected.
     std::thread autostart_thread;
-    if (const char* autostart = std::getenv("MT_AUTOSTART"); autostart != nullptr && autostart[0] == '1') {
+    if (const char* autostart = std::getenv("MT_AUTOSTART");
+        netplay_requested || (autostart != nullptr && autostart[0] == '1')) {
         autostart_thread = std::thread([]() {
             std::this_thread::sleep_for(std::chrono::seconds(2));
             recomp::start_game(supported_games[0].game_id);

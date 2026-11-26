@@ -1,8 +1,16 @@
 diff --git a/librecomp/include/librecomp/game.hpp b/librecomp/include/librecomp/game.hpp
-index 56480d6..6194e3c 100644
+index 56480d6..99935d9 100644
 --- a/librecomp/include/librecomp/game.hpp
 +++ b/librecomp/include/librecomp/game.hpp
-@@ -78,6 +78,8 @@ namespace recomp {
+@@ -71,6 +71,7 @@ namespace recomp {
+     };
+     void register_config_path(std::filesystem::path path);
+     bool register_game(const recomp::GameEntry& entry);
++    bool verify_stored_rom(const GameEntry& game_entry);
+     void check_all_stored_roms();
+     bool load_stored_rom(std::u8string& game_id);
+     RomValidationError select_rom(const std::filesystem::path& rom_path, std::u8string& game_id);
+@@ -78,6 +79,8 @@ namespace recomp {
      bool is_rom_loaded();
      void set_rom_contents(std::vector<uint8_t>&& new_rom);
      std::span<const uint8_t> get_rom();
@@ -12,7 +20,7 @@ index 56480d6..6194e3c 100644
      void do_rom_pio(uint8_t* rdram, gpr ram_address, uint32_t physical_addr);
      const Version& get_project_version();
 diff --git a/librecomp/src/ai.cpp b/librecomp/src/ai.cpp
-index 0195f2b..2ad01b4 100644
+index 0195f2b..f564a1b 100644
 --- a/librecomp/src/ai.cpp
 +++ b/librecomp/src/ai.cpp
 @@ -25,5 +25,6 @@ extern "C" void osAiGetLength_recomp(uint8_t* rdram, recomp_context* ctx) {
@@ -24,7 +32,7 @@ index 0195f2b..2ad01b4 100644
 +    ctx->r2 = ultramodern::is_audio_fifo_full() ? 0x80000000 : 0x00000000;
  }
 diff --git a/librecomp/src/overlays.cpp b/librecomp/src/overlays.cpp
-index 8c8e5d1..dac267f 100644
+index 8c8e5d1..8013b36 100644
 --- a/librecomp/src/overlays.cpp
 +++ b/librecomp/src/overlays.cpp
 @@ -49,6 +49,11 @@ int32_t* section_addresses = nullptr;
@@ -53,11 +61,91 @@ index 8c8e5d1..dac267f 100644
  
      // Sort the executable sections by rom address
      std::sort(&sections_info.code_sections[0], &sections_info.code_sections[sections_info.num_code_sections],
+diff --git a/librecomp/src/pi.cpp b/librecomp/src/pi.cpp
+index d7ebd53..cee2616 100644
+--- a/librecomp/src/pi.cpp
++++ b/librecomp/src/pi.cpp
+@@ -85,6 +85,7 @@ void recomp::do_rom_pio(uint8_t* rdram, gpr ram_address, uint32_t physical_addr)
+ }
+ 
+ struct {
++    bool volatile_saving = false;
+     std::vector<char> save_buffer;
+     std::thread saving_thread;
+     std::filesystem::path save_file_path;
+@@ -170,7 +171,7 @@ void save_write_ptr(const void* in, uint32_t offset, uint32_t count) {
+         memcpy(&save_context.save_buffer[offset], in, count);
+     }
+     
+-    save_context.write_sempahore.signal();
++    if (!save_context.volatile_saving) save_context.write_sempahore.signal();
+ }
+ 
+ void save_write(RDRAM_ARG PTR(void) rdram_address, uint32_t offset, uint32_t count) {
+@@ -183,7 +184,7 @@ void save_write(RDRAM_ARG PTR(void) rdram_address, uint32_t offset, uint32_t cou
+         }
+     }
+ 
+-    save_context.write_sempahore.signal();
++    if (!save_context.volatile_saving) save_context.write_sempahore.signal();
+ }
+ 
+ void save_read(RDRAM_ARG PTR(void) rdram_address, uint32_t offset, uint32_t count) {
+@@ -203,7 +204,7 @@ void save_clear(uint32_t start, uint32_t size, char value) {
+         std::fill_n(save_context.save_buffer.begin() + start, size, value);
+     }
+ 
+-    save_context.write_sempahore.signal();
++    if (!save_context.volatile_saving) save_context.write_sempahore.signal();
+ }
+ 
+ size_t get_save_size(recomp::SaveType save_type) {
+@@ -240,7 +241,16 @@ void read_save_file() {
+     }
+ }
+ 
++void ultramodern::set_volatile_saving() {
++    save_context.volatile_saving = true;
++}
++
+ void ultramodern::init_saving(RDRAM_ARG1) {
++    if (save_context.volatile_saving) {
++        save_context.save_buffer.assign(get_save_size(recomp::get_save_type()), 0);
++        return;
++    }
++
+     set_save_file_path(u8"", recomp::current_game_id());
+ 
+     save_context.save_buffer.resize(get_save_size(recomp::get_save_type()));
+@@ -251,6 +261,7 @@ void ultramodern::init_saving(RDRAM_ARG1) {
+ }
+ 
+ void ultramodern::change_save_file(const std::u8string& subfolder, const std::u8string& name) {
++    if (save_context.volatile_saving) return;
+     // Tell the saving thread that a file swap is pending.
+     save_context.swap_file_pending_sempahore.signal();
+     // Wait until the saving thread indicates it's ready to swap files.
 diff --git a/librecomp/src/recomp.cpp b/librecomp/src/recomp.cpp
-index 8a03dbd..cab7e40 100644
+index 8a03dbd..62768b9 100644
 --- a/librecomp/src/recomp.cpp
 +++ b/librecomp/src/recomp.cpp
-@@ -478,6 +478,12 @@ void run_thread_function(uint8_t* rdram, uint64_t addr, uint64_t sp, uint64_t ar
+@@ -182,10 +182,12 @@ bool write_file(const std::filesystem::path& path, const std::vector<uint8_t>& d
+     return true;
+ }
+ 
+-bool check_stored_rom(const recomp::GameEntry& game_entry) {
+-    std::vector stored_rom_data = read_file(config_path / game_entry.stored_filename());
++bool recomp::verify_stored_rom(const GameEntry& game_entry) {
++    return check_hash(read_file(config_path / game_entry.stored_filename()), game_entry.rom_hash);
++}
+ 
+-    if (!check_hash(stored_rom_data, game_entry.rom_hash)) {
++bool check_stored_rom(const recomp::GameEntry& game_entry) {
++    if (!recomp::verify_stored_rom(game_entry)) {
+         // Incorrect hash, remove the stored ROM file if it exists.
+         std::filesystem::remove(config_path / game_entry.stored_filename());
+         return false;
+@@ -478,6 +480,12 @@ void run_thread_function(uint8_t* rdram, uint64_t addr, uint64_t sp, uint64_t ar
      func(rdram, &ctx);
  }
  
@@ -70,7 +158,7 @@ index 8a03dbd..cab7e40 100644
  void init(uint8_t* rdram, recomp_context* ctx, gpr entrypoint) {
      // Initialize the overlays
      recomp::overlays::init_overlays();
-@@ -649,6 +655,10 @@ bool wait_for_game_started(uint8_t* rdram, recomp_context* context) {
+@@ -649,6 +657,10 @@ bool wait_for_game_started(uint8_t* rdram, recomp_context* context) {
                  auto find_it = game_roms.find(current_game.value());
                  const recomp::GameEntry& game_entry = find_it->second;
  
@@ -81,8 +169,24 @@ index 8a03dbd..cab7e40 100644
                  init(rdram, context, game_entry.entrypoint_address);
                  if (game_entry.on_init_callback) {
                      game_entry.on_init_callback(rdram, context);
+@@ -771,12 +783,11 @@ void recomp::start(
+     uint8_t* rdram;
+     bool alloc_failed;
+ #ifdef _WIN32
+-    rdram = reinterpret_cast<uint8_t*>(VirtualAlloc(nullptr, allocation_size, MEM_COMMIT | MEM_RESERVE, PAGE_NOACCESS));
+-    DWORD old_protect = 0;
++    // Keep the guard range reserved without charging it against the commit limit.
++    rdram = reinterpret_cast<uint8_t*>(VirtualAlloc(nullptr, allocation_size, MEM_RESERVE, PAGE_NOACCESS));
+     alloc_failed = (rdram == nullptr);
+     if (!alloc_failed) {
+-        // VirtualProtect returns 0 on failure.
+-        alloc_failed = (VirtualProtect(rdram, mem_size, PAGE_READWRITE, &old_protect) == 0);
++        alloc_failed = (VirtualAlloc(rdram, mem_size, MEM_COMMIT, PAGE_READWRITE) == nullptr);
+         if (alloc_failed) {
+             VirtualFree(rdram, 0, MEM_RELEASE);
+         }
 diff --git a/ultramodern/include/ultramodern/config.hpp b/ultramodern/include/ultramodern/config.hpp
-index a8cd8e0..139eb99 100644
+index a8cd8e0..7af3738 100644
 --- a/ultramodern/include/ultramodern/config.hpp
 +++ b/ultramodern/include/ultramodern/config.hpp
 @@ -12,6 +12,10 @@ namespace ultramodern {
@@ -159,10 +263,19 @@ index a8cd8e0..139eb99 100644
  
          NLOHMANN_JSON_SERIALIZE_ENUM(ultramodern::renderer::Antialiasing, {
 diff --git a/ultramodern/include/ultramodern/ultramodern.hpp b/ultramodern/include/ultramodern/ultramodern.hpp
-index db45ee4..c0db62a 100644
+index db45ee4..f0d27ae 100644
 --- a/ultramodern/include/ultramodern/ultramodern.hpp
 +++ b/ultramodern/include/ultramodern/ultramodern.hpp
-@@ -74,6 +74,8 @@ enum class ThreadPriority {
+@@ -33,6 +33,8 @@ constexpr uint32_t save_size = 1024 * 1024 / 8; // Maximum save size, 1Mbit for
+ 
+ // Initialization.
+ void preinit(RDRAM_ARG renderer::WindowHandle window_handle);
++// Must be called before game startup. Saves start blank and stay in memory.
++void set_volatile_saving();
+ void init_saving(RDRAM_ARG1);
+ void init_events(RDRAM_ARG renderer::WindowHandle window_handle);
+ void init_timers(RDRAM_ARG1);
+@@ -74,6 +76,8 @@ enum class ThreadPriority {
  void set_native_thread_name(const std::string& name);
  void set_native_thread_priority(ThreadPriority pri);
  PTR(OSThread) this_thread();
@@ -171,7 +284,7 @@ index db45ee4..c0db62a 100644
  void set_main_thread();
  bool is_game_thread();
  void submit_rsp_task(RDRAM_ARG PTR(OSTask) task);
-@@ -98,6 +100,8 @@ void init_audio();
+@@ -98,6 +102,8 @@ void init_audio();
  void set_audio_frequency(uint32_t freq);
  void queue_audio_buffer(RDRAM_ARG PTR(s16) audio_data, uint32_t byte_count);
  uint32_t get_remaining_audio_bytes();
@@ -181,7 +294,7 @@ index db45ee4..c0db62a 100644
  struct audio_callbacks_t {
      using queue_samples_t = void(int16_t*, size_t);
 diff --git a/ultramodern/src/audio.cpp b/ultramodern/src/audio.cpp
-index 3198be0..45a649c 100644
+index 3198be0..94bcc79 100644
 --- a/ultramodern/src/audio.cpp
 +++ b/ultramodern/src/audio.cpp
 @@ -43,6 +43,13 @@ float buffer_offset_frames = 0.5f;
@@ -199,7 +312,7 @@ index 3198be0..45a649c 100644
      // Get the number of remaining buffered audio bytes.
      uint32_t buffered_byte_count;
 diff --git a/ultramodern/src/events.cpp b/ultramodern/src/events.cpp
-index 46f63f1..f50d7b8 100644
+index 46f63f1..4209425 100644
 --- a/ultramodern/src/events.cpp
 +++ b/ultramodern/src/events.cpp
 @@ -1,3 +1,5 @@
@@ -208,7 +321,16 @@ index 46f63f1..f50d7b8 100644
  #include <thread>
  #include <atomic>
  #include <chrono>
-@@ -137,6 +139,7 @@ ultramodern::renderer::ViRegs* ultramodern::renderer::get_vi_regs() {
+@@ -67,6 +69,8 @@ static struct {
+         void update_vi() {
+             ViState* next_state = get_next_state();
+             const OSViMode* next_mode = next_state->mode;
++            // The first host retrace can precede the guest VI initialization.
++            if (next_mode == nullptr) return;
+             const OSViCommonRegs* common_regs = &next_mode->comRegs;
+             const OSViFieldRegs* field_regs = &next_mode->fldRegs[field];
+             PTR(void) framebuffer = osVirtualToPhysical(next_state->framebuffer);
+@@ -137,6 +141,7 @@ ultramodern::renderer::ViRegs* ultramodern::renderer::get_vi_regs() {
  }
  
  extern "C" void osSetEventMesg(RDRAM_ARG OSEvent event_id, PTR(OSMesgQueue) mq_, OSMesg msg) {
@@ -216,7 +338,7 @@ index 46f63f1..f50d7b8 100644
      std::lock_guard lock{ events_context.message_mutex };
  
      switch (event_id) {
-@@ -159,6 +162,7 @@ extern "C" void osSetEventMesg(RDRAM_ARG OSEvent event_id, PTR(OSMesgQueue) mq_,
+@@ -159,6 +164,7 @@ extern "C" void osSetEventMesg(RDRAM_ARG OSEvent event_id, PTR(OSMesgQueue) mq_,
  }
  
  extern "C" void osViSetEvent(RDRAM_ARG PTR(OSMesgQueue) mq_, OSMesg msg, u32 retrace_count) {
@@ -224,7 +346,7 @@ index 46f63f1..f50d7b8 100644
      std::lock_guard lock{ events_context.message_mutex };
      ViState* next_state = events_context.vi.get_next_state();
      next_state->mq = mq_;
-@@ -250,16 +254,20 @@ void vi_thread_func() {
+@@ -250,16 +256,20 @@ void vi_thread_func() {
      }
  }
  
@@ -249,7 +371,7 @@ index 46f63f1..f50d7b8 100644
  }
  
  void task_thread_func(uint8_t* rdram, moodycamel::LightweightSemaphore* thread_ready) {
-@@ -331,6 +339,26 @@ void gfx_thread_func(uint8_t* rdram, moodycamel::LightweightSemaphore* thread_re
+@@ -331,6 +341,26 @@ void gfx_thread_func(uint8_t* rdram, moodycamel::LightweightSemaphore* thread_re
  
      auto renderer_context = ultramodern::renderer::create_render_context(rdram, window_handle, ultramodern::renderer::get_graphics_config().developer_mode);
  
@@ -276,7 +398,7 @@ index 46f63f1..f50d7b8 100644
      renderer_chosen_api.store(renderer_context->get_chosen_api());
      if (!renderer_context->valid()) {
          renderer_setup_result.store(renderer_context->get_setup_result());
-@@ -363,12 +391,24 @@ void gfx_thread_func(uint8_t* rdram, moodycamel::LightweightSemaphore* thread_re
+@@ -363,12 +393,24 @@ void gfx_thread_func(uint8_t* rdram, moodycamel::LightweightSemaphore* thread_re
                  // start another graphics task until the RDP is also complete. Games usually preserve the RSP inputs until the RDP
                  // is finished as well, so sending this early shouldn't be an issue in most cases.
                  // If this causes issues then the logic can be replaced with responding to yield requests.
@@ -303,7 +425,7 @@ index 46f63f1..f50d7b8 100644
                  // printf("Renderer ProcessDList time: %d us\n", static_cast<u32>(std::chrono::duration_cast<std::chrono::microseconds>(renderer_end - renderer_start).count()));
              }
 diff --git a/ultramodern/src/input.cpp b/ultramodern/src/input.cpp
-index 03a7c6b..830be5f 100644
+index 03a7c6b..94d284d 100644
 --- a/ultramodern/src/input.cpp
 +++ b/ultramodern/src/input.cpp
 @@ -71,7 +71,7 @@ static void __osContGetInitData(u8* pattern, OSContStatus *data) {
@@ -316,7 +438,7 @@ index 03a7c6b..830be5f 100644
          else {
              // Mark controller as not connected
 diff --git a/ultramodern/src/mesgqueue.cpp b/ultramodern/src/mesgqueue.cpp
-index 6f38e02..09afd36 100644
+index 6f38e02..597c08a 100644
 --- a/ultramodern/src/mesgqueue.cpp
 +++ b/ultramodern/src/mesgqueue.cpp
 @@ -9,6 +9,7 @@ struct QueuedMessage {
@@ -390,7 +512,7 @@ index 6f38e02..09afd36 100644
  
      if (msg_ != NULLPTR) {
 diff --git a/ultramodern/src/timer.cpp b/ultramodern/src/timer.cpp
-index d36ffcc..86b50e9 100644
+index d36ffcc..2ec12ec 100644
 --- a/ultramodern/src/timer.cpp
 +++ b/ultramodern/src/timer.cpp
 @@ -1,3 +1,5 @@

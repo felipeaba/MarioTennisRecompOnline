@@ -15,3 +15,9 @@ lib/
 *.log
 .vs/
 release/
+
+# Private test packages and saves
+*.zip
+*.sav
+saves/
+outputs/

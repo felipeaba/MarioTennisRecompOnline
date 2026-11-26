@@ -27,9 +27,15 @@
 // The first three are save data: the game writes them to the save like normal unlocks, so they stay
 // after the cheat is switched off. Infinite bounces only lasts while it is on.
 #include "recomp_input.h"
+#ifdef MT_ENABLE_NETPLAY
+#include "mt_netplay.h"
+#endif
 
 namespace {
     void apply_cheats(uint8_t* rdram) {
+#ifdef MT_ENABLE_NETPLAY
+        if (mt::netplay::role() != mt::netplay::Role::Offline) return;
+#endif
         auto b = [&](uint32_t addr, uint8_t v) { rdram[addr ^ 3] = v; };
         using recomp::Cheat; using recomp::CheatMode;
         if (recomp::get_cheat(Cheat::AllCourts) == CheatMode::On) { b(0x653CC, 0xFF); b(0x653CD, 0xFF); }
