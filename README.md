@@ -122,6 +122,7 @@ Requirements: Visual Studio 2022+ Build Tools, LLVM/clang-cl, CMake, Ninja, Pyth
 Technical notes on how the port works are in [NOTES.md](NOTES.md).
 
 ## Credits
+- Playtesting — Micael (MsayP) tested the online mode with me.
 - AI assistance — OpenAI Codex assisted with implementing and testing the online multiplayer mode, building the Windows launcher, and writing the documentation.
 - N64Recomp, N64ModernRuntime and the Zelda64Recomp frontend, by Wiseguy and contributors (GPL-3.0).
 - RT64 by Darío and contributors.
